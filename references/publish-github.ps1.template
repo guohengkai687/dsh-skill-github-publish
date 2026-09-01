@@ -1,0 +1,93 @@
+# dsh-github-publish: publish a local repo to GitHub (one-shot template)
+# Usage (PowerShell 7 / pwsh preferred; do NOT invoke via powershell.exe -File with inline Chinese args):
+#   .\publish-github.ps1.template -RepoDir "D:\path\to\repo" -RepoName "my-repo" -Private:$false
+# Config: set $env:GH_USER / $env:GH_PROXY below or pass -GitHubUser / -Proxy.
+# NOTE: keep this file ASCII-only (English comments) so encoding never bites; for a Chinese
+# commit message, write it to a UTF-8 file and pass -CommitMessageFile instead.
+param(
+    [Parameter(Mandatory=$true)][string]$RepoDir,
+    [string]$RepoName,
+    [string]$RepoDesc = "",
+    [switch]$Private,
+    [string]$GitHubUser,
+    [string]$Proxy = "http://127.0.0.1:34210",
+    [string]$Branch = "main",
+    [string]$CommitMessageFile
+)
+$ErrorActionPreference = "Continue"
+
+# ---- 0. defaults ---- 
+if (-not $GitHubUser) { $GitHubUser = $env:GH_USER }
+if (-not $RepoName)   { $RepoName = Split-Path $RepoDir -Leaf }
+
+# ---- 1. read token from Windows Credential Manager (same process as use) ----
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public class CredPub {
+    [StructLayout(LayoutKind.Sequential)]
+    public struct CREDENTIAL {
+        public uint Flags; public uint Type; public IntPtr TargetName; public IntPtr Comment;
+        public long LastWritten; public uint CredentialBlobSize; public IntPtr CredentialBlob;
+        public uint Persist; public uint AttributeCount; public IntPtr Attributes;
+        public IntPtr TargetAlias; public IntPtr UserName;
+    }
+    [DllImport("advapi32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+    public static extern bool CredRead(string target, int type, int flags, out IntPtr credential);
+    [DllImport("advapi32.dll")]
+    public static extern void CredFree(IntPtr buffer);
+}
+"@
+function Read-GitHubToken($user) {
+    $candidates = @("git:https://$user@github.com", "git:https://github.com")
+    foreach ($t in $candidates) {
+        $ptr = [IntPtr]::Zero
+        if ([CredPub]::CredRead($t, 1, 0, [ref]$ptr)) {
+            $cred = [Runtime.InteropServices.Marshal]::PtrToStructure($ptr, [type][CredPub+CREDENTIAL])
+            $bytes = New-Object byte[] ([int]$cred.CredentialBlobSize)
+            [Runtime.InteropServices.Marshal]::Copy($cred.CredentialBlob, $bytes, 0, $bytes.Length)
+            [CredPub]::CredFree($ptr) | Out-Null
+            $tok = [System.Text.Encoding]::Unicode.GetString($bytes)
+            if ($tok) { return $tok }
+        }
+    }
+    return $null
+}
+$token = Read-GitHubToken $GitHubUser
+if (-not $token) { Write-Host "TOKEN_MISSING: no credential found; store one via cmdkey /generic:git:https://$GitHubUser@github.com /user:$GitHubUser /pass:<token>"; exit 2 }
+Write-Host "OK token(len=$($token.Length))"
+
+# ---- 2. env for Node fetch (proxy) ----
+$env:GH_TOKEN = $token
+$env:GH_REPO_NAME = $RepoName
+$env:GH_REPO_DESC = $RepoDesc
+$env:GH_REPO_PRIVATE = if ($Private) { "true" } else { "false" }
+$env:HTTPS_PROXY = $Proxy
+$env:NODE_USE_ENV_PROXY = "1"
+
+# ---- 3. create repo (idempotent) ----
+$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+node "$scriptDir\create-repo.mjs" $RepoName
+if ($LASTEXITCODE -ne 0) { exit 1 }
+
+# ---- 4. configure remote ----
+git -C $RepoDir remote remove origin 2>&1 | Out-Null
+git -C $RepoDir remote add origin "https://github.com/$GitHubUser/$RepoName.git"
+if ($LASTEXITCODE -ne 0) { Write-Host "REMOTE_ADD_FAILED"; exit 1 }
+Write-Host "remote origin -> https://github.com/$GitHubUser/$RepoName.git"
+
+# ---- 5. commit (if uncommitted changes exist and message provided) ----
+if ($CommitMessageFile -and (git -C $RepoDir status --porcelain)) {
+    git -C $RepoDir add -A
+    git -C $RepoDir commit -F $CommitMessageFile
+}
+
+# ---- 6. push with Authorization header (bypass broken credential helper) ----
+$basic = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("$GitHubUser`:$token"))
+git -C $RepoDir -c http.sslBackend=openssl -c http.proxy=$Proxy -c http.extraHeader="Authorization: Basic $basic" push -u origin $Branch 2>&1
+if ($LASTEXITCODE -ne 0) { Write-Host "PUSH_FAILED exit=$LASTEXITCODE"; exit 1 }
+Write-Host "PUSH_OK"
+
+# ---- 7. verify ----
+git -C $RepoDir -c http.sslBackend=openssl -c http.proxy=$Proxy ls-remote origin 2>&1
+Write-Host "DONE https://github.com/$GitHubUser/$RepoName"
