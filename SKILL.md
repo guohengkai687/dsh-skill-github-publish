@@ -59,10 +59,10 @@ push 的凭据有个坑：本机 GCM（credential manager）在沙箱内无法�
 
 ```powershell
 $basic = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("<user>:$token"))
-git -C <dir> -c http.sslBackend=openssl -c http.proxy=<proxy> -c http.extraHeader="Authorization: Basic $basic" push -u origin main
+git -C <dir> -c http.sslBackend=openssl -c http.proxy=<proxy> -c http.extraHeader="Authorization: Basic $basic" push -u origin master
 ```
 
-- 确认分支名（`git branch --show-current`），不是 main 就 push 对应分支。
+- 确认分支名（`git branch --show-current`），不是 master 就 push 对应分支。
 - token 只在命令参数中存在，**不要**写进 `.git/config` 的 remote URL。
 - 首推后通常建议顺手补 README/LICENSE（README 从项目的 SKILL.md/说明文档提取简介；LICENSE 与同账号其他仓库保持一致，如 MIT）。
 

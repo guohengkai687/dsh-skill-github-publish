@@ -11,7 +11,7 @@ param(
     [switch]$Private,
     [string]$GitHubUser,
     [string]$Proxy = "http://127.0.0.1:34210",
-    [string]$Branch = "main",
+    [string]$Branch = "master",
     [string]$CommitMessageFile
 )
 $ErrorActionPreference = "Continue"
