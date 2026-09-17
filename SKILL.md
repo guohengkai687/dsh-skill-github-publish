@@ -161,6 +161,17 @@ GIT_TERMINAL_PROMPT=0 git -C <目录> \
    `node references/gh-api.mjs commits --repo <owner>/<repo> --branch <branch>` 核对最新 commit 与本地一致。
 3. 向用户汇报：仓库 URL、可见性、推了哪个分支/标签、怎么验证的。
 
+## 更新模式（仓库已存在）
+
+只是往已有仓库追加提交：本地已有 origin 时脚本会自动 `remote set-url` + 幂等建仓（`REPO_EXISTS`），
+不需要也不可能重复建仓。两个提醒：
+
+- **别在推完后裸跑 `git push`**。没有可用凭据助手时，git 会去读 stdin 要用户名/密码；非交互环境里
+  这不会报错而是**挂住直到超时**（实测 60s 以上）。要么再走一遍脚本，要么自己带上
+  `GIT_TERMINAL_PROMPT=0 -c credential.helper= -c http.extraHeader="Authorization: Basic <b64>"`。
+- 改可见性 / 改名：`gh-api.mjs patch --repo <owner>/<name> [--private|--public] [--name <new>] [--desc ...]`，
+  改完记得 `git remote set-url origin` 同步本地。
+
 ## 一键脚本
 
 ```bash
