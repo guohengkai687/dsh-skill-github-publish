@@ -9,7 +9,7 @@
 1. **判断环境** — `uname -s` / `$OS` 决定走 Linux 还是 Windows 分支（凭据与网络坑完全不同）
 2. **前置检查** — git 状态 / 现有 remote / 提交身份 / 目标仓库名与可见性 / 当前分支
 3. **凭据获取** — 环境变量 → `gh_token.txt`（仓库目录、`~/.config` 等）→ Windows 凭据管理器；找到后用 API 反查账号，不向用户索要用户名
-4. **网络适配** — 默认直连；失败按症状降级：代理 / TLS 后端（openssl↔gnutls）/ IP+Host 头绕 DNS
+4. **网络适配** — 默认直连；失败按症状降级：代理 / TLS 后端（openssl↔gnutls）/ DNS 被墙时用 `http.curloptResolve` 固定可达 IP（URL 主机名仍是 github.com，TLS 照常校验）
 5. **创建远程仓库** — `POST /api.github.com/user/repos`，幂等处理"已存在"
 6. **推送** — `http.extraHeader` 携带一次性 Basic Auth，绕开无法弹窗的凭据助手；token 不写入 `.git/config`
 7. **验证** — `ls-remote` + API 核对分支 / 可见性 / 最新提交

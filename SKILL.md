@@ -103,20 +103,34 @@ env | grep -iE '^(https?|all)_proxy='                          # 有代理变量
 | --- | --- |
 | api 200，`ls-remote` 正常 | 直连，什么都不用加 |
 | 环境里就有 `HTTPS_PROXY`/`ALL_PROXY` 且直连失败 | 显式用它：`-c http.proxy=$HTTPS_PROXY`，Node 侧加 `NODE_USE_ENV_PROXY=1` |
-| 卡死/超时，但某个 GitHub IP 可达 | DNS 被墙场景：走 **IP + Host 头**（见下） |
+| 卡死/超时，但某个 GitHub IP 可达 | DNS 解析到死 IP：**只固定解析结果**（`http.curloptResolve`，见下），URL 主机名保持 github.com |
 | TLS 报错（`SEC_E_NO_CREDENTIALS`、证书校验失败） | 换 TLS 后端：`-c http.sslBackend=openssl`；Linux 的 gnutls-only git 不认 openssl，要用 `gnutls`；Windows 沙箱里 curl/PowerShell 的 schannel 会挂，改用 Node `fetch` |
 | 提示连不上代理 | `.git/config` 里多半有**陈旧 `http.proxy` 残留**，用 `-c http.proxy=` 覆盖为空并清掉 `*_proxy` 环境变量 |
 
-IP + Host 头绕行（GitHub 官方北美 IP 实测可达；**不要采信 DoH 返回的第一个 A 记录**，它可能正好是挂掉的那台）：
+DNS 被墙 / 解析到死 IP 时的绕行（**不要采信 DoH 返回的第一个 A 记录**，它可能正好是挂掉的那台；
+先逐 IP 探测：`timeout 4 bash -c 'exec 3<>/dev/tcp/<ip>/443'`）：
 
 ```bash
-IP=140.82.112.3                    # 备选：140.82.113.3 / 140.82.114.3 / 140.82.121.3
-git -C <目录> -c http.extraHeader="Host: github.com" \
-  -c http.extraHeader="Authorization: Basic $BASIC" \
-  push https://$IP/<user>/<repo>.git <branch>:<branch>
+IP=140.82.112.3                    # 实测可达的备选：140.82.113.3 / .114.3 / .121.3
+git -C <目录> -c "http.curloptResolve=github.com:443:$IP" \
+  -c http.extraHeader="Authorization: Basic $BASIC" push -u origin <branch>
 ```
 
-TLS 仍按域名 `github.com` 做 SNI/证书校验，所以 `ssl_verify_result=0` 是正常的，不算降级。
+关键是**只改解析结果，不改 URL 主机名**：URL 仍是 `https://github.com/...`，TLS SNI 与证书校验
+也仍是 `github.com`。反过来把 URL 写成 `https://140.82.112.3/...` 再补 `Host:` 头是**行不通**的——
+证书主体是 `github.com`，git 会直接报 `certificate subject name does not match target host name`。
+
+老 git（无 `http.curloptResolve`）改为在 hosts 层做同样的事，用临时命名空间避免改全局配置：
+
+```bash
+printf '%s github.com\n' "$IP" > /tmp/extra
+grep -vE '[[:space:]]github\.com([[:space:]]|$)' /etc/hosts > /tmp/hosts && cat /tmp/extra >> /tmp/hosts
+unshare -rm bash -c "mount --bind /tmp/hosts /etc/hosts; git -C <目录> \
+  -c http.proxy= -c http.extraHeader='Authorization: Basic $BASIC' push -u origin <branch>"
+```
+
+API 侧（Node 不支持 curloptResolve）：`api.github.com` 通常仍可达；真挂了就把它一起写进上面的
+hosts 覆盖再跑脚本。`GH_IP_OVERRIDE=$IP` 就是把这套 `curloptResolve` 固定下来的开关。
 
 ## 第 4 步：创建远程仓库（幂等）
 

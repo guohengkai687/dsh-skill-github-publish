@@ -25,8 +25,9 @@
 #   GH_PROXY=http://host:port   use this HTTP(S) proxy for git and the API
 #   GH_NO_PROXY=1               force-disable any proxy (clears stale http.proxy config)
 #   GH_SSL_BACKEND=openssl|gnutls|schannel   force a git TLS backend
-#   GH_IP_OVERRIDE=140.82.112.3 push through a reachable GitHub IP with a Host header
-#                               (DNS-blocked networks; skips -u, so no upstream is recorded)
+#   GH_IP_OVERRIDE=140.82.112.3 pin github.com:443 to a reachable IP (http.curloptResolve) for
+#                               DNS-blocked networks; the URL hostname stays github.com so TLS
+#                               SNI and certificate verification keep working
 #
 # Output lines are ASCII and greppable: ENV / TOKEN / USER / REPO_CREATED / REPO_EXISTS /
 # PUSH_OK / DONE, or API_FAIL / PUSH_FAIL / ABORT on failure. Exit codes: 0 ok, 1 remote
@@ -237,24 +238,22 @@ else
 fi
 
 BASIC=$(printf '%s:%s' "$LOGIN" "$TOKEN" | base64 | tr -d '\n')
-PUSH_ARGS=( "${GIT_OPTS[@]}" -c "http.extraHeader=Authorization: Basic $BASIC" )
 if [ -n "${GH_IP_OVERRIDE:-}" ]; then
-  PUSH_ARGS+=( -c "http.extraHeader=Host: github.com" )
-  PUSH_TARGET="https://$GH_IP_OVERRIDE/$LOGIN/$REPO.git"
-  echo "PUSH via IP override $GH_IP_OVERRIDE (no upstream recorded)"
-  if ! GIT_TERMINAL_PROMPT=0 git -C "$DIR" "${PUSH_ARGS[@]}" push "$PUSH_TARGET" "$BRANCH:$BRANCH"; then
-    die "PUSH_FAIL: see SKILL.md step 3 (proxy / TLS backend / IP override)" 1
-  fi
-else
-  PUSH_TARGET="origin"
-  if ! GIT_TERMINAL_PROMPT=0 git -C "$DIR" "${PUSH_ARGS[@]}" push -u origin "$BRANCH"; then
-    die "PUSH_FAIL: see SKILL.md step 3 (proxy / TLS backend / IP override)" 1
-  fi
+  # Pin the DNS answer while keeping the URL hostname github.com, so SNI and certificate
+  # verification still see github.com (rewriting the URL to an IP breaks TLS with
+  # "certificate subject name does not match"). Needs git >= 2.30-ish; on older builds use
+  # the unshare + /etc/hosts trick documented in SKILL.md step 3.
+  GIT_OPTS+=( -c "http.curloptResolve=github.com:443:$GH_IP_OVERRIDE" )
+  echo "NET pinning github.com:443 -> $GH_IP_OVERRIDE (http.curloptResolve)"
+fi
+PUSH_ARGS=( "${GIT_OPTS[@]}" -c "http.extraHeader=Authorization: Basic $BASIC" )
+if ! GIT_TERMINAL_PROMPT=0 git -C "$DIR" "${PUSH_ARGS[@]}" push -u origin "$BRANCH"; then
+  die "PUSH_FAIL: see SKILL.md step 3 (proxy / TLS backend / GH_IP_OVERRIDE)" 1
 fi
 echo "PUSH_OK $BRANCH"
 
 # ---------------------------------------------------------------- 9. verify
-git -C "$DIR" "${PUSH_ARGS[@]}" ls-remote "$PUSH_TARGET" HEAD || echo "WARN ls-remote failed (push may still be fine; re-check in step 6)"
+git -C "$DIR" "${PUSH_ARGS[@]}" ls-remote origin HEAD || echo "WARN ls-remote failed (push may still be fine; re-check in step 6)"
 api get --repo "$LOGIN/$REPO" || echo "WARN verify: repo lookup failed"
 api commits --repo "$LOGIN/$REPO" --branch "$BRANCH" || echo "WARN verify: commit lookup failed"
 echo "DONE https://github.com/$LOGIN/$REPO"
