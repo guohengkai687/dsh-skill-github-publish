@@ -1,26 +1,65 @@
-# dsh-github-publish: publish a local repo to GitHub (one-shot template)
-# Usage (PowerShell 7 / pwsh preferred; do NOT invoke via powershell.exe -File with inline Chinese args):
-#   .\publish-github.ps1.template -RepoDir "D:\path\to\repo" -RepoName "my-repo" -Private:$false
-# Config: set $env:GH_USER / $env:GH_PROXY below or pass -GitHubUser / -Proxy.
-# NOTE: keep this file ASCII-only (English comments) so encoding never bites; for a Chinese
-# commit message, write it to a UTF-8 file and pass -CommitMessageFile instead.
+# dsh-skill-github-publish: publish a local repo to GitHub (Windows one-shot template)
+#
+# Platform: native Windows (PowerShell 7 / pwsh preferred; powershell.exe 5.1 also works).
+# On Linux / macOS / WSL / Git-Bash use references/publish-github.sh instead.
+#
+# Usage:
+#   .\publish-github.ps1.template -RepoDir "D:\path\to\repo" [-RepoName my-repo] [-RepoDesc "one line"]
+#                                 [-Private] [-Branch master] [-CommitMessageFile msg.txt]
+#                                 [-TokenFile C:\path\gh_token.txt] [-Proxy http://127.0.0.1:7890]
+#                                 [-SslBackend openssl] [-DryRun]
+#
+# Credential order (same as publish-github.sh): $env:GH_TOKEN / $env:GITHUB_TOKEN ->
+# gh_token.txt (repo dir, cwd, %USERPROFILE%\.config, %USERPROFILE%) -> Windows Credential
+# Manager entry git:https://USER@github.com. The token is never printed and never written
+# into .git/config.
+#
+# NOTE: keep this file ASCII-only (English messages) so console code pages never garble it.
+# For a commit message containing non-ASCII text, write it to a UTF-8 file and pass
+# -CommitMessageFile; never inline it into powershell.exe -Command.
 param(
     [Parameter(Mandatory=$true)][string]$RepoDir,
     [string]$RepoName,
     [string]$RepoDesc = "",
     [switch]$Private,
     [string]$GitHubUser,
-    [string]$Proxy = "http://127.0.0.1:34210",
-    [string]$Branch = "master",
-    [string]$CommitMessageFile
+    [string]$Proxy = "",
+    [string]$SslBackend = "",
+    [string]$Branch = "",
+    [string]$CommitMessageFile,
+    [string]$TokenFile = "",
+    [switch]$DryRun
 )
 $ErrorActionPreference = "Continue"
 
-# ---- 0. defaults ---- 
-if (-not $GitHubUser) { $GitHubUser = $env:GH_USER }
-if (-not $RepoName)   { $RepoName = Split-Path $RepoDir -Leaf }
+# ------------------------------------------------------------------ 0. platform + preflight
+if (-not ($env:OS -eq "Windows_NT")) {
+    Write-Host "NOT_WINDOWS: use references/publish-github.sh on this platform"
+    exit 2
+}
+$RepoDir = (Resolve-Path -LiteralPath $RepoDir).Path
+if (-not (Test-Path -LiteralPath (Join-Path $RepoDir ".git"))) {
+    Write-Host "NOT_A_REPO: $RepoDir (run: git -C '$RepoDir' init -b master)"
+    exit 2
+}
+if (-not $RepoName) { $RepoName = Split-Path $RepoDir -Leaf }
+if (-not $Branch) { $Branch = (git -C $RepoDir branch --show-current) }
+if (-not $Branch) { Write-Host "NO_BRANCH: pass -Branch"; exit 2 }
+Write-Host "ENV os=windows dir=$RepoDir branch=$Branch"
+$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$apiJs = Join-Path $scriptDir "gh-api.mjs"
 
-# ---- 1. read token from Windows Credential Manager (same process as use) ----
+# ------------------------------------------------------------------ 1. token: env -> gh_token.txt -> Credential Manager
+function Get-TokenFromFile([string]$path) {
+    if (-not $path -or -not (Test-Path -LiteralPath $path)) { return $null }
+    foreach ($line in (Get-Content -LiteralPath $path -Encoding UTF8)) {
+        $v = $line.Trim().Trim('"').Trim("'")
+        if ($v -match '[=:]') { $v = ($v -split '[=:]')[-1].Trim() }
+        if ($v -match '^(gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|[0-9a-f]{40})$') { return $v }
+    }
+    return $null
+}
+
 Add-Type -TypeDefinition @"
 using System;
 using System.Runtime.InteropServices;
@@ -38,9 +77,13 @@ public class CredPub {
     public static extern void CredFree(IntPtr buffer);
 }
 "@
-function Read-GitHubToken($user) {
-    $candidates = @("git:https://$user@github.com", "git:https://github.com")
+function Read-CredentialManagerToken([string]$user) {
+    $candidates = @()
+    if ($user) { $candidates += "git:https://$user@github.com" }
+    $candidates += "git:https://github.com"
+    $candidates += "GitHub for Visual Studio - https://$user@github.com/"
     foreach ($t in $candidates) {
+        if (-not $t) { continue }
         $ptr = [IntPtr]::Zero
         if ([CredPub]::CredRead($t, 1, 0, [ref]$ptr)) {
             $cred = [Runtime.InteropServices.Marshal]::PtrToStructure($ptr, [type][CredPub+CREDENTIAL])
@@ -48,46 +91,115 @@ function Read-GitHubToken($user) {
             [Runtime.InteropServices.Marshal]::Copy($cred.CredentialBlob, $bytes, 0, $bytes.Length)
             [CredPub]::CredFree($ptr) | Out-Null
             $tok = [System.Text.Encoding]::Unicode.GetString($bytes)
-            if ($tok) { return $tok }
+            if ($tok) { return $tok.Trim() }
         }
     }
     return $null
 }
-$token = Read-GitHubToken $GitHubUser
-if (-not $token) { Write-Host "TOKEN_MISSING: no credential found; store one via cmdkey /generic:git:https://$GitHubUser@github.com /user:$GitHubUser /pass:<token>"; exit 2 }
-Write-Host "OK token(len=$($token.Length))"
 
-# ---- 2. env for Node fetch (proxy) ----
-$env:GH_TOKEN = $token
-$env:GH_REPO_NAME = $RepoName
-$env:GH_REPO_DESC = $RepoDesc
-$env:GH_REPO_PRIVATE = if ($Private) { "true" } else { "false" }
-$env:HTTPS_PROXY = $Proxy
-$env:NODE_USE_ENV_PROXY = "1"
+$token = $null; $tokenSrc = ""
+if ($env:GH_TOKEN) { $token = $env:GH_TOKEN.Trim(); $tokenSrc = "env:GH_TOKEN" }
+elseif ($env:GITHUB_TOKEN) { $token = $env:GITHUB_TOKEN.Trim(); $tokenSrc = "env:GITHUB_TOKEN" }
+else {
+    $candidates = @()
+    if ($TokenFile) { $candidates += $TokenFile }
+    $candidates += (Join-Path $RepoDir "gh_token.txt")
+    $candidates += (Join-Path (Get-Location).Path "gh_token.txt")
+    $candidates += (Join-Path $env:USERPROFILE ".config\gh_token.txt")
+    $candidates += (Join-Path $env:USERPROFILE "gh_token.txt")
+    foreach ($f in $candidates) {
+        $t = Get-TokenFromFile $f
+        if ($t) { $token = $t; $tokenSrc = $f; break }
+    }
+    if (-not $token) {
+        $t = Read-CredentialManagerToken $GitHubUser
+        if ($t) { $token = $t; $tokenSrc = "Credential Manager" }
+    }
+}
+if (-not $token) {
+    Write-Host "NO_TOKEN: set `$env:GH_TOKEN, drop a gh_token.txt next to the repo, or store a"
+    Write-Host "          credential via: cmdkey /generic:git:https://USER@github.com /user:USER /pass:<token>"
+    exit 2
+}
+Write-Host "TOKEN ok prefix=$($token.Substring(0,4))... len=$($token.Length) source=$tokenSrc"
 
-# ---- 3. create repo (idempotent) ----
-$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-node "$scriptDir\create-repo.mjs" $RepoName
-if ($LASTEXITCODE -ne 0) { exit 1 }
-
-# ---- 4. configure remote ----
-git -C $RepoDir remote remove origin 2>&1 | Out-Null
-git -C $RepoDir remote add origin "https://github.com/$GitHubUser/$RepoName.git"
-if ($LASTEXITCODE -ne 0) { Write-Host "REMOTE_ADD_FAILED"; exit 1 }
-Write-Host "remote origin -> https://github.com/$GitHubUser/$RepoName.git"
-
-# ---- 5. commit (if uncommitted changes exist and message provided) ----
-if ($CommitMessageFile -and (git -C $RepoDir status --porcelain)) {
-    git -C $RepoDir add -A
-    git -C $RepoDir commit -F $CommitMessageFile
+# ------------------------------------------------------------------ 2. safety: token must not be committed
+$tracked = git -C $RepoDir ls-files --error-unmatch gh_token.txt 2>$null
+if ($tracked) {
+    Write-Host "ABORT: gh_token.txt is tracked by git - the token would live in history forever."
+    Write-Host "       git -C '$RepoDir' rm --cached gh_token.txt, then revoke and reissue the token."
+    exit 3
+}
+$tokenPath = Join-Path $RepoDir "gh_token.txt"
+if ((Test-Path -LiteralPath $tokenPath)) {
+    git -C $RepoDir check-ignore -q gh_token.txt
+    if ($LASTEXITCODE -ne 0) {
+        Add-Content -LiteralPath (Join-Path $RepoDir ".gitignore") -Value "`n# local GitHub credential - never commit`ngh_token.txt"
+        Write-Host "SAFETY added gh_token.txt to .gitignore"
+    }
 }
 
-# ---- 6. push with Authorization header (bypass broken credential helper) ----
-$basic = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("$GitHubUser`:$token"))
-git -C $RepoDir -c http.sslBackend=openssl -c http.proxy=$Proxy -c http.extraHeader="Authorization: Basic $basic" push -u origin $Branch 2>&1
-if ($LASTEXITCODE -ne 0) { Write-Host "PUSH_FAILED exit=$LASTEXITCODE"; exit 1 }
-Write-Host "PUSH_OK"
+# ------------------------------------------------------------------ 3. env for Node fetch (proxy only when asked)
+$env:GH_TOKEN = $token
+if ($Proxy) {
+    $env:HTTPS_PROXY = $Proxy; $env:HTTP_PROXY = $Proxy; $env:NODE_USE_ENV_PROXY = "1"
+    Write-Host "NET proxy=$Proxy"
+} else {
+    Remove-Item Env:HTTPS_PROXY -ErrorAction SilentlyContinue
+    Remove-Item Env:HTTP_PROXY -ErrorAction SilentlyContinue
+    Write-Host "NET direct (pass -Proxy only if the network needs one)"
+}
 
-# ---- 7. verify ----
-git -C $RepoDir -c http.sslBackend=openssl -c http.proxy=$Proxy ls-remote origin 2>&1
-Write-Host "DONE https://github.com/$GitHubUser/$RepoName"
+# ------------------------------------------------------------------ 4. resolve the account from the token
+$who = node $apiJs whoami 2>&1
+if ($LASTEXITCODE -ne 0) { Write-Host $who; Write-Host "API_FAIL: cannot reach api.github.com or the token is invalid"; exit 1 }
+$login = ("$who" -replace '^USER\s+', '').Trim()
+Write-Host "USER $login (account resolved from the token)"
+
+# ------------------------------------------------------------------ 5. branch safety + plan
+$remoteUrl = "https://github.com/$login/$RepoName.git"
+Write-Host "PLAN repo=$login/$RepoName private=$($Private.IsPresent) branch=$Branch origin=$remoteUrl"
+if ($DryRun) { Write-Host "DRY_RUN ok: platform, credentials and API access verified; remote unchanged"; exit 0 }
+
+# ------------------------------------------------------------------ 6. create repo (idempotent)
+$createArgs = @($apiJs, "create", "--name", $RepoName)
+if ($Private) { $createArgs += "--private" }
+if ($RepoDesc) { $createArgs += @("--desc", $RepoDesc) }
+$createOut = node @createArgs 2>&1
+if ($LASTEXITCODE -ne 0) { Write-Host $createOut; Write-Host "API_FAIL: could not create $login/$RepoName"; exit 1 }
+Write-Host $createOut
+
+# ------------------------------------------------------------------ 7. remote + optional commit
+git -C $RepoDir remote remove origin 2>&1 | Out-Null
+git -C $RepoDir remote add origin $remoteUrl
+if ($LASTEXITCODE -ne 0) { Write-Host "REMOTE_ADD_FAILED"; exit 1 }
+Write-Host "REMOTE origin -> $remoteUrl"
+
+if ($CommitMessageFile -and (git -C $RepoDir status --porcelain)) {
+    git -C $RepoDir add -A
+    $staged = git -C $RepoDir diff --cached
+    if ("$staged" -match 'gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}') {
+        Write-Host "ABORT: a token literal is staged for commit - remove it first (and revoke the token)"
+        exit 3
+    }
+    git -C $RepoDir commit -F $CommitMessageFile
+    if ($LASTEXITCODE -ne 0) { Write-Host "COMMIT_FAILED"; exit 1 }
+}
+
+# ------------------------------------------------------------------ 8. push with a one-shot Authorization header
+# The sandboxed GCM cannot prompt (and may fail outright), so bypass credential helpers entirely.
+# Tokens never go into the remote URL, where they would persist in .git/config.
+$basic = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("$login`:$token"))
+$gitOpts = @("-c", "credential.helper=")
+if ($SslBackend) { $gitOpts += @("-c", "http.sslBackend=$SslBackend") }
+if ($Proxy) { $gitOpts += @("-c", "http.proxy=$Proxy") }
+$env:GIT_TERMINAL_PROMPT = "0"
+git -C $RepoDir @gitOpts -c "http.extraHeader=Authorization: Basic $basic" push -u origin $Branch 2>&1
+if ($LASTEXITCODE -ne 0) { Write-Host "PUSH_FAILED exit=$LASTEXITCODE"; exit 1 }
+Write-Host "PUSH_OK $Branch"
+
+# ------------------------------------------------------------------ 9. verify
+git -C $RepoDir @gitOpts -c "http.extraHeader=Authorization: Basic $basic" ls-remote origin HEAD 2>&1
+node $apiJs get --repo "$login/$RepoName"
+node $apiJs commits --repo "$login/$RepoName" --branch $Branch
+Write-Host "DONE https://github.com/$login/$RepoName"

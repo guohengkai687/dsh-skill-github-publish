@@ -9,3 +9,8 @@ Thumbs.db
 *.tmp
 *.bak
 *.log
+
+# Local GitHub credential - NEVER commit the token
+gh_token.txt
+*gh_token*
+*:Zone.Identifier
